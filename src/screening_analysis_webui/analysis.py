@@ -26,6 +26,7 @@ def build_adjusted_prices(prices: pd.DataFrame) -> pd.DataFrame:
 
     adjusted = prices.copy()
     adjusted["AdjFactor"] = pd.to_numeric(adjusted["AdjFactor"], errors="coerce").fillna(1.0).replace(0, 1.0)
+    adjusted["O"] = pd.to_numeric(adjusted["O"], errors="coerce")
     adjusted["C"] = pd.to_numeric(adjusted["C"], errors="coerce")
     adjusted["Vo"] = pd.to_numeric(adjusted["Vo"], errors="coerce")
     adjusted["Va"] = pd.to_numeric(adjusted["Va"], errors="coerce")
@@ -34,6 +35,7 @@ def build_adjusted_prices(prices: pd.DataFrame) -> pd.DataFrame:
     adjusted = adjusted.sort_values(["Code", "Date"], ascending=[True, False]).reset_index(drop=True)
     future_factor = adjusted.groupby("Code", sort=False)["AdjFactor"].shift(1).fillna(1.0)
     adjusted["CumAdj"] = future_factor.groupby(adjusted["Code"], sort=False).cumprod()
+    adjusted["AdjO"] = adjusted["O"] * adjusted["CumAdj"]
     adjusted["AdjC"] = adjusted["C"] * adjusted["CumAdj"]
     adjusted["AdjVo"] = adjusted["Vo"] / adjusted["CumAdj"]
     adjusted = adjusted.sort_values(["Code", "Date"]).reset_index(drop=True)
@@ -328,33 +330,58 @@ def attach_forward_returns(
     signals: pd.DataFrame,
     prices: pd.DataFrame,
     business_days: pd.DatetimeIndex,
-    horizons: tuple[int, ...],
+    exit_date: pd.Timestamp,
+    shares: int = 100,
 ) -> pd.DataFrame:
     if signals.empty:
         return signals.copy()
 
     result = signals.copy()
-    price_lookup = prices[["Code", "Date", "AdjC"]].rename(columns={"AdjC": "exit_price"})
     trading_days = business_days.sort_values()
 
-    for months in horizons:
-        target_dates = result["Date"] + pd.DateOffset(months=months)
-        positions = trading_days.searchsorted(target_dates.values)
-        exit_dates = pd.Series(pd.NaT, index=result.index, dtype="datetime64[ns]")
-        valid = positions < len(trading_days)
-        if valid.any():
-            exit_dates.loc[valid] = trading_days[positions[valid]]
+    entry_positions = trading_days.searchsorted(result["Date"].values, side="right")
+    entry_dates = pd.Series(pd.NaT, index=result.index, dtype="datetime64[ns]")
+    valid_entries = entry_positions < len(trading_days)
+    if valid_entries.any():
+        entry_dates.loc[valid_entries] = trading_days[entry_positions[valid_entries]]
 
-        merge_df = pd.DataFrame({"Code": result["Code"].values, f"exit_{months}m_date": exit_dates.values})
-        priced = merge_df.merge(
-            price_lookup,
-            left_on=["Code", f"exit_{months}m_date"],
-            right_on=["Code", "Date"],
-            how="left",
-        )
-        result[f"exit_{months}m_date"] = priced[f"exit_{months}m_date"].values
-        result[f"price_{months}m"] = priced["exit_price"].values
-        result[f"ret_{months}m"] = result[f"price_{months}m"] / result["AdjC"] - 1.0
+    exit_ts = pd.Timestamp(exit_date).normalize()
+    exit_dates = pd.Series(pd.NaT, index=result.index, dtype="datetime64[ns]")
+    if exit_ts in trading_days:
+        exit_dates.loc[entry_dates.notna() & (entry_dates <= exit_ts)] = exit_ts
+
+    entry_lookup = prices[["Code", "Date", "AdjO"]].rename(columns={"AdjO": "entry_price"})
+    exit_lookup = prices[["Code", "Date", "AdjC"]].rename(columns={"AdjC": "exit_price"})
+
+    priced = pd.DataFrame(
+        {
+            "Code": result["Code"].values,
+            "entry_date": entry_dates.values,
+            "exit_date": exit_dates.values,
+        },
+        index=result.index,
+    )
+    priced = priced.merge(
+        entry_lookup,
+        left_on=["Code", "entry_date"],
+        right_on=["Code", "Date"],
+        how="left",
+    ).drop(columns=["Date"])
+    priced = priced.merge(
+        exit_lookup,
+        left_on=["Code", "exit_date"],
+        right_on=["Code", "Date"],
+        how="left",
+    ).drop(columns=["Date"])
+
+    result["entry_date"] = priced["entry_date"].values
+    result["exit_date"] = priced["exit_date"].values
+    result["entry_price"] = priced["entry_price"].values
+    result["exit_price"] = priced["exit_price"].values
+    result["buy_amount_yen"] = result["entry_price"] * shares
+    result["sell_amount_yen"] = result["exit_price"] * shares
+    result["profit_yen"] = result["sell_amount_yen"] - result["buy_amount_yen"]
+    result["ret"] = result["exit_price"] / result["entry_price"] - 1.0
 
     return result
 
@@ -379,14 +406,12 @@ def apply_cooldown(signals: pd.DataFrame, business_days: pd.DatetimeIndex, coold
     return signals.loc[sorted(kept_indices)].copy()
 
 
-def summarize_horizons(signals: pd.DataFrame, horizons: tuple[int, ...]) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    for months in horizons:
-        column = f"ret_{months}m"
-        sample = signals[column].dropna() if column in signals.columns else pd.Series(dtype=float)
-        rows.append(
+def summarize_returns(signals: pd.DataFrame, return_col: str = "ret") -> pd.DataFrame:
+    sample = signals[return_col].dropna() if return_col in signals.columns else pd.Series(dtype=float)
+    return pd.DataFrame(
+        [
             {
-                "horizon": f"{months}m",
+                "return_type": "翌営業日始値→指定日終値",
                 "count": int(sample.shape[0]),
                 "mean": float(sample.mean()) if not sample.empty else np.nan,
                 "median": float(sample.median()) if not sample.empty else np.nan,
@@ -397,8 +422,8 @@ def summarize_horizons(signals: pd.DataFrame, horizons: tuple[int, ...]) -> pd.D
                 "p75": float(sample.quantile(0.75)) if not sample.empty else np.nan,
                 "p90": float(sample.quantile(0.90)) if not sample.empty else np.nan,
             }
-        )
-    return pd.DataFrame(rows)
+        ]
+    )
 
 
 def summarize_by_group(
@@ -463,7 +488,6 @@ def build_pipeline_table(
     final_signal_count: int,
     complete_signal_count: int,
     cooldown_signal_count: int,
-    max_horizon_months: int,
 ) -> pd.DataFrame:
     baseline = max(price_candidate_count, 1)
     return pd.DataFrame(
@@ -480,7 +504,7 @@ def build_pipeline_table(
                 "share_vs_initial": final_signal_count / baseline,
             },
             {
-                "stage": f"{max_horizon_months}か月リターン観測可能",
+                "stage": "リターン観測可能",
                 "count": complete_signal_count,
                 "share_vs_initial": complete_signal_count / baseline,
             },
@@ -508,12 +532,12 @@ def build_empty_result(
         final_signal_count=final_signal_count,
         complete_signal_count=complete_signal_count,
         cooldown_signal_count=cooldown_signal_count,
-        max_horizon_months=config.max_horizon_months,
     )
     metadata = {
         "analysis_start": config.signal_start.isoformat(),
         "analysis_end": config.signal_end.isoformat(),
         "latest_price_date": latest_price_date.date().isoformat() if latest_price_date is not None else None,
+        "return_exit_date": config.effective_return_exit_date.isoformat(),
         "signal_count": final_signal_count,
         "cooldown_signal_count": cooldown_signal_count,
     }
@@ -523,8 +547,8 @@ def build_empty_result(
         cooldown_signals=empty,
         latest_screening=empty,
         pipeline=pipeline,
-        horizon_summary=summarize_horizons(empty, config.return_horizons),
-        cooldown_horizon_summary=summarize_horizons(empty, config.return_horizons),
+        horizon_summary=summarize_returns(empty),
+        cooldown_horizon_summary=summarize_returns(empty),
         market_summary=empty,
         sector_summary=empty,
         year_summary=empty,
@@ -547,15 +571,16 @@ def run_analysis(
 
     history_buffer_days = max(800, max(config.breakout_lookback_days, config.volume_lookback_days) * 3)
     calendar_start = pd.Timestamp(config.signal_start) - pd.Timedelta(days=history_buffer_days)
-    calendar_end = (
-        pd.Timestamp(config.signal_end) + pd.DateOffset(months=config.max_horizon_months + 1) + pd.Timedelta(days=14)
-    ).normalize()
+    requested_exit_date = pd.Timestamp(config.effective_return_exit_date).normalize()
+    calendar_end = (max(pd.Timestamp(config.signal_end), requested_exit_date) + pd.Timedelta(days=14)).normalize()
 
     _emit_progress(progress_callback, "営業日カレンダーを取得しています", 0.08)
     calendar = load_calendar(client=client, start=calendar_start, end=calendar_end, cache_dir=cache_dir)
     business_days = pd.DatetimeIndex(calendar.loc[calendar["HolDiv"].astype(str) == "1", "Date"]).sort_values()
     if business_days.empty:
         raise RuntimeError("営業日カレンダーが空でした。")
+    if requested_exit_date not in business_days:
+        raise RuntimeError("売却日は営業日を指定してください。指定日の終値でリターンを計算します。")
 
     signal_start_ts = pd.Timestamp(config.signal_start)
     signal_end_ts = pd.Timestamp(config.signal_end)
@@ -575,8 +600,19 @@ def run_analysis(
 
     prices = build_adjusted_prices(prices)
     latest_price_date = pd.Timestamp(prices["Date"].max())
+    price_dates = pd.DatetimeIndex(prices["Date"].dropna().drop_duplicates()).normalize()
+    if requested_exit_date > latest_price_date or requested_exit_date not in price_dates:
+        raise RuntimeError(
+            f"売却日 {requested_exit_date.date()} の価格データがまだ取得できません。"
+            f"最新価格日 {latest_price_date.date()} 以前の営業日を指定してください。"
+        )
     business_days = business_days[business_days <= latest_price_date]
     signal_days = signal_days[signal_days <= latest_price_date]
+    if signal_days.empty:
+        raise RuntimeError(
+            f"指定したシグナル期間に価格データがありません。"
+            f"最新価格日 {latest_price_date.date()} 以前の期間を指定してください。"
+        )
     prices = prices[prices["Date"] <= latest_price_date].copy()
     prices = build_price_features(
         prices=prices,
@@ -631,14 +667,14 @@ def run_analysis(
             final_signal_count=0,
         )
 
-    _emit_progress(progress_callback, "将来リターンを計算しています", 0.78)
-    signals = attach_forward_returns(filtered, prices, business_days, config.return_horizons)
+    _emit_progress(progress_callback, "指定日のリターンを計算しています", 0.78)
+    signals = attach_forward_returns(filtered, prices, business_days, requested_exit_date)
     signals = signals.sort_values(["Date", "Code"]).reset_index(drop=True)
     cooldown_signals = apply_cooldown(signals, business_days, config.cooldown_business_days)
     cooldown_signals = cooldown_signals.sort_values(["Date", "Code"]).reset_index(drop=True)
 
-    longest_return_col = f"ret_{config.max_horizon_months}m"
-    complete_signal_count = int(signals[longest_return_col].notna().sum()) if longest_return_col in signals.columns else 0
+    return_col = "ret"
+    complete_signal_count = int(signals[return_col].notna().sum()) if return_col in signals.columns else 0
     cooldown_signal_count = int(cooldown_signals.shape[0])
 
     pipeline = build_pipeline_table(
@@ -647,15 +683,14 @@ def run_analysis(
         final_signal_count=final_signal_count,
         complete_signal_count=complete_signal_count,
         cooldown_signal_count=cooldown_signal_count,
-        max_horizon_months=config.max_horizon_months,
     )
 
     _emit_progress(progress_callback, "集計テーブルを作成しています", 0.92)
-    horizon_summary = summarize_horizons(signals, config.return_horizons)
-    cooldown_horizon_summary = summarize_horizons(cooldown_signals, config.return_horizons)
-    market_summary = summarize_by_group(signals, "MktNm", longest_return_col, min_count=10)
-    sector_summary = summarize_by_group(signals, "S33Nm", longest_return_col, min_count=10, top_n=15)
-    year_summary = summarize_by_year(signals, longest_return_col)
+    horizon_summary = summarize_returns(signals, return_col)
+    cooldown_horizon_summary = summarize_returns(cooldown_signals, return_col)
+    market_summary = summarize_by_group(signals, "MktNm", return_col, min_count=10)
+    sector_summary = summarize_by_group(signals, "S33Nm", return_col, min_count=10, top_n=15)
+    year_summary = summarize_by_year(signals, return_col)
 
     latest_signal_date = pd.Timestamp(signals["Date"].max()) if not signals.empty else None
     latest_screening = (
@@ -666,15 +701,16 @@ def run_analysis(
         else pd.DataFrame()
     )
 
-    observed = signals.dropna(subset=[longest_return_col]).copy()
-    top_signals = observed.sort_values(longest_return_col, ascending=False).head(50).reset_index(drop=True)
-    bottom_signals = observed.sort_values(longest_return_col, ascending=True).head(50).reset_index(drop=True)
+    observed = signals.dropna(subset=[return_col]).copy()
+    top_signals = observed.sort_values(return_col, ascending=False).head(50).reset_index(drop=True)
+    bottom_signals = observed.sort_values(return_col, ascending=True).head(50).reset_index(drop=True)
 
     metadata = {
         "analysis_start": config.signal_start.isoformat(),
         "analysis_end": config.signal_end.isoformat(),
         "latest_price_date": latest_price_date.date().isoformat(),
         "latest_signal_date": latest_signal_date.date().isoformat() if latest_signal_date is not None else None,
+        "return_exit_date": requested_exit_date.date().isoformat(),
         "signal_count": int(signals.shape[0]),
         "cooldown_signal_count": int(cooldown_signals.shape[0]),
         "complete_signal_count": complete_signal_count,

@@ -29,20 +29,20 @@ class ScreeningConfig:
     min_operating_profit_growth_pct: float | None = None
     min_operating_margin_pct: float | None = None
     cooldown_business_days: int = 20
-    return_horizons: tuple[int, ...] = (3, 6, 9, 12)
+    return_exit_date: date | None = None
     exclude_funds: bool = True
 
     def __post_init__(self) -> None:
         if self.signal_end < self.signal_start:
             raise ValueError("signal_end must be on or after signal_start")
-        horizons = tuple(sorted({int(months) for months in self.return_horizons if int(months) > 0}))
-        if not horizons:
-            raise ValueError("return_horizons must include at least one positive month")
-        object.__setattr__(self, "return_horizons", horizons)
+        if self.return_exit_date is None:
+            object.__setattr__(self, "return_exit_date", self.signal_end)
 
     @property
-    def max_horizon_months(self) -> int:
-        return max(self.return_horizons)
+    def effective_return_exit_date(self) -> date:
+        if self.return_exit_date is None:
+            return self.signal_end
+        return self.return_exit_date
 
 
 @dataclass

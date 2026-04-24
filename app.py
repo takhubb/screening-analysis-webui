@@ -39,6 +39,14 @@ def format_signal_table(df: pd.DataFrame) -> pd.DataFrame:
         "MktNm",
         "S33Nm",
         "AdjC",
+        "entry_date",
+        "entry_price",
+        "exit_date",
+        "exit_price",
+        "buy_amount_yen",
+        "sell_amount_yen",
+        "profit_yen",
+        "ret",
         "volume_ratio",
         "high_break_ratio",
         "turnover_yen",
@@ -60,6 +68,14 @@ def format_signal_table(df: pd.DataFrame) -> pd.DataFrame:
         "MktNm": "市場",
         "S33Nm": "業種",
         "AdjC": "調整後終値",
+        "entry_date": "購入日",
+        "entry_price": "購入始値(調整後)",
+        "exit_date": "売却日",
+        "exit_price": "売却終値(調整後)",
+        "buy_amount_yen": "購入額(100株)",
+        "sell_amount_yen": "売却額(100株)",
+        "profit_yen": "損益(100株)",
+        "ret": "リターン",
         "volume_ratio": "出来高倍率",
         "high_break_ratio": "高値更新率",
         "turnover_yen": "売買代金(円)",
@@ -76,11 +92,14 @@ def format_signal_table(df: pd.DataFrame) -> pd.DataFrame:
 
     if "シグナル日" in formatted.columns:
         formatted["シグナル日"] = pd.to_datetime(formatted["シグナル日"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for column in ("購入日", "売却日"):
+        if column in formatted.columns:
+            formatted[column] = pd.to_datetime(formatted[column], errors="coerce").dt.strftime("%Y-%m-%d")
 
-    for column in ("調整後終値", "PBR", "出来高倍率"):
+    for column in ("調整後終値", "購入始値(調整後)", "売却終値(調整後)", "PBR", "出来高倍率"):
         if column in formatted.columns:
             formatted[column] = pd.to_numeric(formatted[column], errors="coerce").round(2)
-    for column in ("売買代金(円)", "時価総額(円)"):
+    for column in ("売買代金(円)", "時価総額(円)", "購入額(100株)", "売却額(100株)", "損益(100株)"):
         if column in formatted.columns:
             formatted[column] = pd.to_numeric(formatted[column], errors="coerce").round(0)
     for column in (
@@ -89,6 +108,7 @@ def format_signal_table(df: pd.DataFrame) -> pd.DataFrame:
         "売上成長率",
         "営業利益成長率",
         "営業利益率",
+        "リターン",
         *[name for name in formatted.columns if "リターン" in name],
     ):
         if column in formatted.columns:
@@ -100,16 +120,17 @@ def format_signal_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def render_summary_metrics(metadata: dict[str, object]) -> None:
-    metrics = st.columns(4)
+    metrics = st.columns(5)
     metrics[0].metric("シグナル件数", f"{int(metadata.get('signal_count', 0)):,}")
     metrics[1].metric("クールダウン後件数", f"{int(metadata.get('cooldown_signal_count', 0)):,}")
     metrics[2].metric("最終価格日", str(metadata.get("latest_price_date") or "-"))
     metrics[3].metric("最新シグナル日", str(metadata.get("latest_signal_date") or "-"))
+    metrics[4].metric("売却指定日", str(metadata.get("return_exit_date") or "-"))
 
 
 def main() -> None:
     st.title("J-Quants スクリーニング & リターン分析 WebUI")
-    st.caption("`references` のロジックを参考にしつつ、bulk キャッシュを使って条件スクリーニングと将来リターン分析を行います。")
+    st.caption("bulk キャッシュを使って条件スクリーニングと、基準日翌営業日始値から指定日終値までのリターン分析を行います。")
 
     with st.sidebar:
         st.subheader("分析期間")
@@ -188,11 +209,7 @@ def main() -> None:
         )
 
         st.subheader("リターン分析")
-        return_horizons = st.multiselect(
-            "分析ホライズン(月)",
-            options=[1, 3, 6, 9, 12, 18, 24],
-            default=[3, 6, 9, 12],
-        )
+        return_exit_date = st.date_input("売却日(営業日)", value=signal_end, help="指定日の終値で売却します。")
         cooldown_business_days = st.number_input("同一銘柄のクールダウン(営業日)", min_value=0, max_value=120, value=20, step=1)
 
         run_button = st.button("スクリーニングと分析を実行", use_container_width=True, type="primary")
@@ -201,10 +218,6 @@ def main() -> None:
         if not target_markets:
             st.error("対象市場を 1 つ以上選択してください。")
             st.stop()
-        if not return_horizons:
-            st.error("分析ホライズンを 1 つ以上選択してください。")
-            st.stop()
-
         config = ScreeningConfig(
             signal_start=signal_start,
             signal_end=signal_end,
@@ -221,7 +234,7 @@ def main() -> None:
             min_operating_profit_growth_pct=float(min_operating_profit_growth_pct) if use_op_growth else None,
             min_operating_margin_pct=float(min_operating_margin_pct) if use_op_margin else None,
             cooldown_business_days=int(cooldown_business_days),
-            return_horizons=tuple(int(months) for months in return_horizons),
+            return_exit_date=return_exit_date,
             exclude_funds=exclude_funds,
         )
 
@@ -247,7 +260,7 @@ def main() -> None:
 
     result = st.session_state.get("analysis_result")
     if result is None:
-        st.info("左の条件を設定して実行すると、スクリーニング結果と将来リターン分析を表示します。")
+        st.info("左の条件を設定して実行すると、スクリーニング結果と指定日売却リターン分析を表示します。")
         return
 
     render_summary_metrics(result.metadata)
@@ -257,8 +270,7 @@ def main() -> None:
         st.dataframe(format_percent_columns(result.pipeline, ["share_vs_initial"]), use_container_width=True)
         return
 
-    longest_horizon = max(st.session_state["analysis_config"].return_horizons)
-    longest_return_col = f"ret_{longest_horizon}m"
+    return_col = "ret"
 
     tabs = st.tabs(["概要", "集計", "最新スクリーニング", "全シグナル"])
 
@@ -266,7 +278,7 @@ def main() -> None:
         st.subheader("パイプライン")
         st.dataframe(format_percent_columns(result.pipeline, ["share_vs_initial"]), use_container_width=True)
 
-        st.subheader("ホライズン別サマリー")
+        st.subheader("リターンサマリー")
         summary_display = format_percent_columns(
             result.horizon_summary,
             ["mean", "median", "std", "win_rate", "p10", "p25", "p75", "p90"],
@@ -276,12 +288,12 @@ def main() -> None:
         chart_df = result.horizon_summary.copy()
         if not chart_df.empty:
             melted = chart_df.melt(
-                id_vars="horizon",
+                id_vars="return_type",
                 value_vars=["mean", "median", "win_rate"],
                 var_name="metric",
                 value_name="value",
             )
-            fig = px.bar(melted, x="horizon", y="value", color="metric", barmode="group", title="平均・中央値・勝率")
+            fig = px.bar(melted, x="return_type", y="value", color="metric", barmode="group", title="平均・中央値・勝率")
             fig.update_layout(yaxis_tickformat=".0%")
             st.plotly_chart(fig, use_container_width=True)
 
@@ -295,16 +307,16 @@ def main() -> None:
         with right:
             st.subheader("業種別")
             st.dataframe(format_percent_columns(result.sector_summary, ["mean", "median", "win_rate"]), use_container_width=True)
-            st.subheader(f"{longest_horizon}か月リターン分布")
-            returns = result.signals[longest_return_col].dropna()
+            st.subheader("リターン分布")
+            returns = result.signals[return_col].dropna()
             if returns.empty:
-                st.info("分布を描けるだけの将来リターンがまだありません。")
+                st.info("分布を描けるだけのリターンがまだありません。")
             else:
                 fig = px.histogram(
                     x=returns * 100.0,
                     nbins=40,
-                    labels={"x": f"{longest_horizon}か月リターン(%)"},
-                    title=f"{longest_horizon}か月リターンの分布",
+                    labels={"x": "リターン(%)"},
+                    title="リターンの分布",
                 )
                 st.plotly_chart(fig, use_container_width=True)
 

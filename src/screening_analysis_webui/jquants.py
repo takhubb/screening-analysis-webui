@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
-from requests.exceptions import RequestException, RetryError
+from requests.exceptions import HTTPError, RequestException, RetryError
 
 try:
     import jquantsapi
@@ -102,6 +102,13 @@ def _parse_bulk_key_coverage(key: str) -> tuple[pd.Timestamp, pd.Timestamp]:
 def _is_rate_limited_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+def _parse_subscription_start_date(exc: Exception) -> pd.Timestamp | None:
+    match = re.search(r"covers the following dates:\s*(\d{4}-\d{2}-\d{2})\s*~", str(exc))
+    if match is None:
+        return None
+    return pd.Timestamp(match.group(1)).normalize()
 
 
 def _call_with_rate_limit_retry(
@@ -255,10 +262,27 @@ def load_calendar(
     else:
         cached = pd.DataFrame()
 
-    fetched = client.get_mkt_calendar(
-        from_yyyymmdd=start.strftime("%Y-%m-%d"),
-        to_yyyymmdd=end.strftime("%Y-%m-%d"),
-    )
+    fetch_start = start
+    try:
+        fetched = client.get_mkt_calendar(
+            from_yyyymmdd=fetch_start.strftime("%Y-%m-%d"),
+            to_yyyymmdd=end.strftime("%Y-%m-%d"),
+        )
+    except HTTPError as exc:
+        subscription_start = _parse_subscription_start_date(exc)
+        if subscription_start is None or subscription_start > end or fetch_start >= subscription_start:
+            raise
+
+        fetch_start = subscription_start
+        print(
+            f"[warn] 契約開始日より前のカレンダーは取得できないため、"
+            f"{fetch_start.date()} から取得し直します。",
+            flush=True,
+        )
+        fetched = client.get_mkt_calendar(
+            from_yyyymmdd=fetch_start.strftime("%Y-%m-%d"),
+            to_yyyymmdd=end.strftime("%Y-%m-%d"),
+        )
     if fetched.empty:
         raise RuntimeError("取引カレンダーを取得できませんでした。")
 
