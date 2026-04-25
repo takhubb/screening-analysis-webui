@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
 import streamlit as st
 
 from screening_analysis_webui import AnalysisResult, ScreeningConfig, run_analysis
+from screening_analysis_webui.analysis import SUMMARY_METRIC_COLUMNS, summarize_returns
 from screening_analysis_webui.jquants import DEFAULT_CACHE_DIR, load_dotenv
-from screening_analysis_webui.models import MARKET_OPTIONS, SECTOR_33_OPTIONS
+from screening_analysis_webui.models import MARKET_OPTIONS
 
 
 st.set_page_config(
@@ -17,130 +23,9 @@ st.set_page_config(
 load_dotenv()
 
 
-RETURN_MONTHS = (3, 6, 9, 12)
-SUMMARY_METRIC_COLUMNS = [
-    "count",
-    "mean",
-    "median",
-    "std",
-    "min",
-    "p10",
-    "p25",
-    "p75",
-    "p90",
-    "max",
-    "win_rate",
-    "sharpe",
-    "max_drawdown",
-]
-SUMMARY_PERCENT_COLUMNS = [
-    "mean",
-    "median",
-    "std",
-    "min",
-    "p10",
-    "p25",
-    "p75",
-    "p90",
-    "max",
-    "win_rate",
-    "max_drawdown",
-]
-
-
-def format_percent_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    formatted = df.copy()
-    for column in columns:
-        if column in formatted.columns:
-            formatted[column] = formatted[column].map(lambda value: f"{value:.2%}" if pd.notna(value) else "")
-    return formatted
-
-
-def format_signal_table(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-
-    columns = [
-        "Date",
-        "Code",
-        "CoName",
-        "MktNm",
-        "S33Nm",
-        "AdjC",
-        "entry_date",
-        "entry_price",
-        "buy_amount_yen",
-    ]
-    for months in RETURN_MONTHS:
-        columns.extend([f"exit_date_{months}m", f"ret_{months}m"])
-    columns.extend(
-        [
-            "volume_ratio",
-            "high_break_ratio",
-            "turnover_yen",
-            "market_cap",
-            "PER",
-            "PBR",
-            "equity_ratio",
-            "sales_growth_yoy",
-            "operating_profit_growth_yoy",
-            "operating_margin",
-        ]
-    )
-
-    available = [column for column in columns if column in df.columns]
-    formatted = df.loc[:, available].copy()
-    renamed = {
-        "Date": "シグナル日",
-        "Code": "銘柄コード",
-        "CoName": "銘柄名",
-        "MktNm": "市場",
-        "S33Nm": "業種",
-        "AdjC": "シグナル日終値(調整後)",
-        "entry_date": "エントリー日",
-        "entry_price": "エントリー始値(調整後)",
-        "buy_amount_yen": "購入額(100株)",
-        "volume_ratio": "出来高倍率",
-        "high_break_ratio": "高値更新率",
-        "turnover_yen": "売買代金(円)",
-        "market_cap": "時価総額(円)",
-        "PER": "PER",
-        "PBR": "PBR",
-        "equity_ratio": "自己資本比率",
-        "sales_growth_yoy": "売上成長率",
-        "operating_profit_growth_yoy": "営業利益成長率",
-        "operating_margin": "営業利益率",
-    }
-    for months in RETURN_MONTHS:
-        renamed[f"exit_date_{months}m"] = f"{months}ヶ月後評価日"
-        renamed[f"ret_{months}m"] = f"{months}ヶ月後リターン"
-    formatted = formatted.rename(columns=renamed)
-
-    date_columns = ["シグナル日", "エントリー日", *[f"{months}ヶ月後評価日" for months in RETURN_MONTHS]]
-    for column in date_columns:
-        if column in formatted.columns:
-            formatted[column] = pd.to_datetime(formatted[column], errors="coerce").dt.strftime("%Y-%m-%d")
-
-    for column in ("シグナル日終値(調整後)", "エントリー始値(調整後)", "PER", "PBR", "出来高倍率"):
-        if column in formatted.columns:
-            formatted[column] = pd.to_numeric(formatted[column], errors="coerce").round(2)
-    for column in ("売買代金(円)", "時価総額(円)", "購入額(100株)"):
-        if column in formatted.columns:
-            formatted[column] = pd.to_numeric(formatted[column], errors="coerce").round(0)
-    for column in (
-        "高値更新率",
-        "自己資本比率",
-        "売上成長率",
-        "営業利益成長率",
-        "営業利益率",
-        *[f"{months}ヶ月後リターン" for months in RETURN_MONTHS],
-    ):
-        if column in formatted.columns:
-            formatted[column] = pd.to_numeric(formatted[column], errors="coerce").map(
-                lambda value: round(value * 100.0, 2) if pd.notna(value) else value
-            )
-
-    return formatted
+ROOT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = ROOT_DIR / "output"
+RETURN_HORIZON_LABELS = ("3ヶ月後", "6ヶ月後", "9ヶ月後", "12ヶ月後")
 
 
 def parse_optional_float(raw_value: str, label: str, filter_name: str, errors: list[str]) -> float | None:
@@ -166,9 +51,9 @@ def optional_float_input(
     return parse_optional_float(raw_value, label, filter_name, errors)
 
 
-def render_filter_patterns() -> tuple[list[dict[str, object]], list[str]]:
-    st.subheader("フィルター")
-    st.caption("数値条件は空欄にすると、そのフィルターでは適用しません。")
+def render_filter_patterns() -> tuple[list[dict[str, Any]], list[str]]:
+    st.subheader("スクリーニング条件")
+    st.caption("数値条件は空欄にすると、そのフィルターでは適用しません。業種はフィルターせず、CSVで全業種と業種別に集計します。")
 
     defaults = [
         {
@@ -213,12 +98,12 @@ def render_filter_patterns() -> tuple[list[dict[str, object]], list[str]]:
     ]
 
     errors: list[str] = []
-    patterns: list[dict[str, object]] = []
+    patterns: list[dict[str, Any]] = []
     columns = st.columns(3)
     for index, column in enumerate(columns):
         default = defaults[index]
         with column:
-            st.markdown(f"**フィルター {index + 1}**")
+            st.markdown(f"**パターン {index + 1}**")
             filter_name = st.text_input("名称", value=str(default["name"]), key=f"filter_name_{index}")
             filter_name = filter_name.strip() or f"パターン{index + 1}"
             target_markets = st.multiselect(
@@ -226,12 +111,7 @@ def render_filter_patterns() -> tuple[list[dict[str, object]], list[str]]:
                 options=list(MARKET_OPTIONS),
                 default=list(default["target_markets"]),
                 key=f"target_markets_{index}",
-            )
-            target_sectors = st.multiselect(
-                "業種",
-                options=list(SECTOR_33_OPTIONS),
-                default=[],
-                key=f"target_sectors_{index}",
+                help="空欄の場合は市場で絞り込みません。",
             )
             exclude_funds = st.checkbox("ETF / ETN / REIT を除外", value=True, key=f"exclude_funds_{index}")
 
@@ -310,7 +190,6 @@ def render_filter_patterns() -> tuple[list[dict[str, object]], list[str]]:
                 {
                     "filter_name": filter_name,
                     "target_markets": tuple(target_markets),
-                    "target_sectors": tuple(target_sectors),
                     "exclude_funds": exclude_funds,
                     "min_turnover_oku": min_turnover_oku,
                     "min_market_cap_oku": min_market_cap_oku,
@@ -329,76 +208,188 @@ def render_filter_patterns() -> tuple[list[dict[str, object]], list[str]]:
     return patterns, errors
 
 
-def render_summary_metrics(results: list[AnalysisResult]) -> None:
-    latest_price_dates = [result.metadata.get("latest_price_date") for result in results if result.metadata.get("latest_price_date")]
-    latest_signal_dates = [
-        result.metadata.get("latest_signal_date") for result in results if result.metadata.get("latest_signal_date")
-    ]
-    complete_count = sum(int(result.metadata.get("complete_signal_count", 0)) for result in results)
-
-    metrics = st.columns(4)
-    metrics[0].metric("フィルター数", f"{len(results):,}")
-    metrics[1].metric("リターン観測可能", f"{complete_count:,}")
-    metrics[2].metric("最終価格日", str(max(latest_price_dates) if latest_price_dates else "-"))
-    metrics[3].metric("最新シグナル日", str(max(latest_signal_dates) if latest_signal_dates else "-"))
+def join_values(values: tuple[str, ...]) -> str:
+    return "全市場" if not values else " / ".join(values)
 
 
-def build_combined_summary(results: list[AnalysisResult], attr_name: str) -> pd.DataFrame:
+def describe_optional(label: str, value: float | None, suffix: str = "") -> str:
+    if value is None:
+        return f"{label}=なし"
+    return f"{label}={value:g}{suffix}"
+
+
+def build_buy_signal_description(config: ScreeningConfig) -> str:
+    return "; ".join(
+        [
+            f"期間={config.signal_start.isoformat()}..{config.signal_end.isoformat()}",
+            f"高値更新比較={config.breakout_lookback_days}営業日",
+            f"高値更新率下限={config.min_breakout_pct:g}%",
+            f"出来高平均比較={config.volume_lookback_days}営業日",
+            f"出来高倍率下限={config.min_volume_ratio:g}倍",
+            "エントリー=買いシグナル翌営業日始値",
+            f"評価={', '.join(RETURN_HORIZON_LABELS)}",
+            f"クールダウン={config.cooldown_business_days}営業日",
+        ]
+    )
+
+
+def build_screening_description(config: ScreeningConfig) -> str:
+    return "; ".join(
+        [
+            f"対象市場={join_values(config.target_markets)}",
+            f"ETF/ETN/REIT除外={'あり' if config.exclude_funds else 'なし'}",
+            describe_optional("売買代金下限", config.min_turnover_oku, "億円"),
+            describe_optional("時価総額下限", config.min_market_cap_oku, "億円"),
+            describe_optional("時価総額上限", config.max_market_cap_oku, "億円"),
+            describe_optional("PER上限", config.max_per),
+            describe_optional("PBR上限", config.max_pbr),
+            describe_optional("自己資本比率下限", config.min_equity_ratio_pct, "%"),
+            describe_optional("売上成長率下限", config.min_sales_growth_pct, "%"),
+            describe_optional("営業利益成長率下限", config.min_operating_profit_growth_pct, "%"),
+            describe_optional("営業利益率下限", config.min_operating_margin_pct, "%"),
+            "業種フィルター=なし",
+        ]
+    )
+
+
+def build_condition_columns(config: ScreeningConfig, result: AnalysisResult) -> dict[str, object]:
+    return {
+        "filter_pattern": config.filter_name,
+        "buy_signal_conditions": build_buy_signal_description(config),
+        "screening_conditions": build_screening_description(config),
+        "signal_start": config.signal_start.isoformat(),
+        "signal_end": config.signal_end.isoformat(),
+        "buy_signal_breakout_lookback_days": config.breakout_lookback_days,
+        "buy_signal_min_breakout_pct": config.min_breakout_pct,
+        "buy_signal_volume_lookback_days": config.volume_lookback_days,
+        "buy_signal_min_volume_ratio": config.min_volume_ratio,
+        "cooldown_business_days": config.cooldown_business_days,
+        "screening_target_markets": join_values(config.target_markets),
+        "screening_exclude_funds": config.exclude_funds,
+        "screening_min_turnover_oku": config.min_turnover_oku,
+        "screening_min_market_cap_oku": config.min_market_cap_oku,
+        "screening_max_market_cap_oku": config.max_market_cap_oku,
+        "screening_max_per": config.max_per,
+        "screening_max_pbr": config.max_pbr,
+        "screening_min_equity_ratio_pct": config.min_equity_ratio_pct,
+        "screening_min_sales_growth_pct": config.min_sales_growth_pct,
+        "screening_min_operating_profit_growth_pct": config.min_operating_profit_growth_pct,
+        "screening_min_operating_margin_pct": config.min_operating_margin_pct,
+        "screening_sector_filter": "なし",
+        "signal_count": int(result.metadata.get("signal_count", 0)),
+        "cooldown_signal_count": int(result.metadata.get("cooldown_signal_count", 0)),
+        "complete_signal_count": int(result.metadata.get("complete_signal_count", 0)),
+        "latest_signal_date": result.metadata.get("latest_signal_date"),
+        "latest_price_date": result.metadata.get("latest_price_date"),
+    }
+
+
+def summarize_cooldown_by_sector(signals: pd.DataFrame) -> pd.DataFrame:
+    if signals.empty or "S33Nm" not in signals.columns:
+        return pd.DataFrame(columns=["summary_scope", "sector", "horizon", *SUMMARY_METRIC_COLUMNS])
+
     frames: list[pd.DataFrame] = []
-    for result in results:
-        frame = getattr(result, attr_name).copy()
-        frame.insert(0, "filter_pattern", result.metadata.get("filter_name", "-"))
-        frames.append(frame)
+    sector_source = signals.copy()
+    sector_source["S33Nm"] = sector_source["S33Nm"].fillna("未分類").astype(str)
+    for sector_name, sector_signals in sector_source.groupby("S33Nm", sort=True):
+        summary = summarize_returns(sector_signals)
+        summary.insert(0, "summary_scope", "業種別")
+        summary.insert(1, "sector", sector_name)
+        frames.append(summary)
+
     if not frames:
-        return pd.DataFrame(columns=["filter_pattern", "horizon", *SUMMARY_METRIC_COLUMNS])
-    combined = pd.concat(frames, ignore_index=True)
-    columns = ["filter_pattern", "horizon", *SUMMARY_METRIC_COLUMNS]
-    return combined.loc[:, [column for column in columns if column in combined.columns]]
-
-
-def build_count_summary(results: list[AnalysisResult]) -> pd.DataFrame:
-    rows = []
-    for result in results:
-        rows.append(
-            {
-                "filter_pattern": result.metadata.get("filter_name", "-"),
-                "signal_count": int(result.metadata.get("signal_count", 0)),
-                "complete_signal_count": int(result.metadata.get("complete_signal_count", 0)),
-                "cooldown_signal_count": int(result.metadata.get("cooldown_signal_count", 0)),
-                "latest_signal_date": result.metadata.get("latest_signal_date"),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def build_pipeline_summary(results: list[AnalysisResult]) -> pd.DataFrame:
-    frames = []
-    for result in results:
-        pipeline = result.pipeline.copy()
-        pipeline.insert(0, "filter_pattern", result.metadata.get("filter_name", "-"))
-        frames.append(pipeline)
-    if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["summary_scope", "sector", "horizon", *SUMMARY_METRIC_COLUMNS])
     return pd.concat(frames, ignore_index=True)
 
 
-def select_result(results: list[AnalysisResult], key: str) -> AnalysisResult:
-    labels = [str(result.metadata.get("filter_name", f"パターン{index + 1}")) for index, result in enumerate(results)]
-    selected_label = st.selectbox("表示するフィルター", options=labels, key=key)
-    selected_index = labels.index(selected_label)
-    return results[selected_index]
+def build_export_frame(configs: list[ScreeningConfig], results: list[AnalysisResult]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for config, result in zip(configs, results, strict=True):
+        condition_columns = build_condition_columns(config, result)
+
+        all_sector_summary = result.cooldown_horizon_summary.copy()
+        all_sector_summary.insert(0, "summary_scope", "全業種")
+        all_sector_summary.insert(1, "sector", "全業種")
+
+        sector_summary = summarize_cooldown_by_sector(result.cooldown_signals)
+        combined = pd.concat([all_sector_summary, sector_summary], ignore_index=True)
+
+        for column_name, value in condition_columns.items():
+            combined.insert(0, column_name, value)
+        frames.append(combined)
+
+    if not frames:
+        return pd.DataFrame()
+
+    condition_columns = list(build_condition_columns(configs[0], results[0]).keys())
+    ordered_columns = [
+        *condition_columns,
+        "summary_scope",
+        "sector",
+        "horizon",
+        *SUMMARY_METRIC_COLUMNS,
+    ]
+    export_frame = pd.concat(frames, ignore_index=True)
+    return export_frame.loc[:, [column for column in ordered_columns if column in export_frame.columns]]
+
+
+def compact_number(value: float) -> str:
+    text = f"{value:g}"
+    return text.replace("-", "m").replace(".", "p")
+
+
+def sanitize_filename_component(value: str) -> str:
+    safe = re.sub(r"[^\w.-]+", "-", value.strip())
+    safe = safe.strip("-_.")
+    return safe or "conditions"
+
+
+def compact_optional_number(value: float | None) -> str:
+    return "none" if value is None else compact_number(value)
+
+
+def compact_markets(markets: tuple[str, ...]) -> str:
+    if not markets:
+        return "allmkt"
+    labels = {"プライム": "prime", "スタンダード": "std", "グロース": "growth"}
+    return "".join(labels.get(market, sanitize_filename_component(market)) for market in markets)
+
+
+def build_output_filename(configs: list[ScreeningConfig]) -> str:
+    first = configs[0]
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    start = first.signal_start.strftime("%Y%m%d")
+    end = first.signal_end.strftime("%Y%m%d")
+    signal_part = (
+        f"high{first.breakout_lookback_days}d{compact_number(first.min_breakout_pct)}pct_"
+        f"vol{first.volume_lookback_days}d{compact_number(first.min_volume_ratio)}x_"
+        f"cd{first.cooldown_business_days}d"
+    )
+    market_part = "mkt" + "-".join(compact_markets(config.target_markets) for config in configs)
+    cap_part = "cap" + "-".join(compact_optional_number(config.max_market_cap_oku) for config in configs)
+    pbr_part = "pbr" + "-".join(compact_optional_number(config.max_pbr) for config in configs)
+    pattern_part = sanitize_filename_component("-".join(config.filter_name for config in configs))
+    return f"cooldown_returns_{start}-{end}_{signal_part}_{market_part}_{cap_part}_{pbr_part}_{pattern_part}_{timestamp}.csv"
+
+
+def write_export_csv(configs: list[ScreeningConfig], results: list[AnalysisResult]) -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / build_output_filename(configs)
+    export_frame = build_export_frame(configs, results)
+    export_frame.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
 
 
 def main() -> None:
     st.title("J-Quants スクリーニング & リターン分析 WebUI")
-    st.caption("bulk キャッシュを使って買いシグナル抽出と、翌営業日始値エントリー後の固定期間リターン分析を行います。")
+    st.caption("条件を指定して実行すると、クールダウン後の全業種・業種別リターン結果をCSVに出力します。")
 
     with st.sidebar:
         st.subheader("分析期間")
         signal_start = st.date_input("シグナル開始日", value=pd.Timestamp("2021-04-19").date())
         signal_end = st.date_input("シグナル終了日", value=pd.Timestamp.today().date())
 
-        st.subheader("買いシグナル")
+        st.subheader("買いシグナル条件")
         breakout_lookback_days = st.number_input("高値更新の比較期間(営業日)", min_value=20, max_value=520, value=252, step=5)
         min_breakout_pct = st.number_input("高値更新率の下限(%)", min_value=0.0, max_value=50.0, value=0.0, step=0.5)
         volume_lookback_days = st.number_input("出来高平均の比較期間(営業日)", min_value=5, max_value=120, value=20, step=1)
@@ -406,7 +397,7 @@ def main() -> None:
 
         st.subheader("リターン分析")
         cooldown_business_days = st.number_input("同一銘柄のクールダウン(営業日)", min_value=0, max_value=120, value=20, step=1)
-        run_button = st.button("スクリーニングと分析を実行", use_container_width=True, type="primary")
+        run_button = st.button("CSVを出力", use_container_width=True, type="primary")
 
     filter_patterns, filter_errors = render_filter_patterns()
 
@@ -420,7 +411,6 @@ def main() -> None:
                 signal_end=signal_end,
                 filter_name=str(pattern["filter_name"]),
                 target_markets=tuple(pattern["target_markets"]),
-                target_sectors=tuple(pattern["target_sectors"]),
                 breakout_lookback_days=int(breakout_lookback_days),
                 min_breakout_pct=float(min_breakout_pct),
                 volume_lookback_days=int(volume_lookback_days),
@@ -454,88 +444,23 @@ def main() -> None:
                     progress_bar.progress(min(max(int(total_progress * 100), 0), 100))
 
                 results.append(run_analysis(config=config, cache_dir=DEFAULT_CACHE_DIR, progress_callback=on_progress))
+
+            output_path = write_export_csv(configs, results)
         except Exception as exc:  # pragma: no cover
             status.update(label="分析に失敗しました", state="error")
             progress_bar.progress(0)
             st.exception(exc)
             st.stop()
 
-        status.update(label="分析が完了しました", state="complete")
+        status.update(label="完了しました", state="complete")
         progress_bar.progress(100)
-        st.session_state["analysis_results"] = results
-        st.session_state["analysis_configs"] = configs
+        st.session_state["last_output_path"] = str(output_path)
 
-    results = st.session_state.get("analysis_results")
-    if not results:
-        st.info("買いシグナルとフィルターを設定して実行すると、3パターンのリターンサマリーを比較表示します。")
-        return
-
-    render_summary_metrics(results)
-
-    if all(result.signals.empty for result in results):
-        st.warning("条件に一致するシグナルはありませんでした。条件を少し緩めて再実行してください。")
-
-    tabs = st.tabs(["比較サマリー", "最新スクリーニング", "全シグナル"])
-
-    with tabs[0]:
-        st.subheader("パターン別件数")
-        st.dataframe(build_count_summary(results), use_container_width=True)
-
-        st.subheader("リターンサマリー")
-        summary_display = format_percent_columns(build_combined_summary(results, "horizon_summary"), SUMMARY_PERCENT_COLUMNS)
-        st.dataframe(summary_display, use_container_width=True)
-
-        st.subheader("クールダウン後リターンサマリー")
-        cooldown_summary_display = format_percent_columns(
-            build_combined_summary(results, "cooldown_horizon_summary"),
-            SUMMARY_PERCENT_COLUMNS,
-        )
-        st.dataframe(cooldown_summary_display, use_container_width=True)
-
-        st.subheader("パイプライン")
-        st.dataframe(format_percent_columns(build_pipeline_summary(results), ["share_vs_initial"]), use_container_width=True)
-
-    with tabs[1]:
-        selected_result = select_result(results, "latest_result_selector")
-        latest = format_signal_table(selected_result.latest_screening)
-        latest_date = selected_result.metadata.get("latest_signal_date")
-        st.subheader(f"最新シグナル日: {latest_date or '-'}")
-        st.dataframe(latest, use_container_width=True, height=520)
-        st.download_button(
-            "最新スクリーニング CSV をダウンロード",
-            data=latest.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"latest_screening_{selected_result.metadata.get('filter_name', 'pattern')}_{latest_date}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="download_latest",
-        )
-
-    with tabs[2]:
-        selected_result = select_result(results, "all_result_selector")
-        all_signals = format_signal_table(selected_result.signals)
-        cooldown_signals = format_signal_table(selected_result.cooldown_signals)
-
-        st.subheader("全シグナル")
-        st.dataframe(all_signals, use_container_width=True, height=520)
-        st.download_button(
-            "全シグナル CSV をダウンロード",
-            data=all_signals.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"signals_all_{selected_result.metadata.get('filter_name', 'pattern')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="download_all",
-        )
-
-        st.subheader("クールダウン後シグナル")
-        st.dataframe(cooldown_signals, use_container_width=True, height=420)
-        st.download_button(
-            "クールダウン後 CSV をダウンロード",
-            data=cooldown_signals.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"signals_cooldown_{selected_result.metadata.get('filter_name', 'pattern')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="download_cooldown",
-        )
+    output_path = st.session_state.get("last_output_path")
+    if output_path:
+        st.success(f"完了しました。CSVを出力しました: {output_path}")
+    else:
+        st.info("条件を設定して「CSVを出力」を押すと、結果CSVを `output/` に作成します。")
 
 
 if __name__ == "__main__":

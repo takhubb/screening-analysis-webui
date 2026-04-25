@@ -10,41 +10,6 @@ import pandas as pd
 ProgressCallback = Callable[[str, float], None]
 
 MARKET_OPTIONS = ("プライム", "スタンダード", "グロース")
-SECTOR_33_OPTIONS = (
-    "水産・農林業",
-    "鉱業",
-    "建設業",
-    "食料品",
-    "繊維製品",
-    "パルプ・紙",
-    "化学",
-    "医薬品",
-    "石油・石炭製品",
-    "ゴム製品",
-    "ガラス・土石製品",
-    "鉄鋼",
-    "非鉄金属",
-    "金属製品",
-    "機械",
-    "電気機器",
-    "輸送用機器",
-    "精密機器",
-    "その他製品",
-    "電気・ガス業",
-    "陸運業",
-    "海運業",
-    "空運業",
-    "倉庫・運輸関連業",
-    "情報・通信業",
-    "卸売業",
-    "小売業",
-    "銀行業",
-    "証券、商品先物取引業",
-    "保険業",
-    "その他金融業",
-    "不動産業",
-    "サービス業",
-)
 
 
 @dataclass(frozen=True)
@@ -53,7 +18,6 @@ class ScreeningConfig:
     signal_end: date
     filter_name: str = "パターン1"
     target_markets: tuple[str, ...] = ("プライム", "スタンダード")
-    target_sectors: tuple[str, ...] = ()
     breakout_lookback_days: int = 252
     min_breakout_pct: float = 0.0
     volume_lookback_days: int = 20

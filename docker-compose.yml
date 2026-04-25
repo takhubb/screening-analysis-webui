@@ -9,4 +9,5 @@ services:
       PYTHONPATH: /app/src
     volumes:
       - ./.cache:/app/.cache
+      - ./output:/app/output
     restart: unless-stopped

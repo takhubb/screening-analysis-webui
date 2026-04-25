@@ -99,8 +99,6 @@ def filter_target_markets(master_df: pd.DataFrame, config: ScreeningConfig) -> p
     filtered["Code"] = filtered["Code"].astype(str)
     if config.target_markets:
         filtered = filtered[filtered["MktNm"].isin(config.target_markets)].copy()
-    if config.target_sectors and "S33Nm" in filtered.columns:
-        filtered = filtered[filtered["S33Nm"].isin(config.target_sectors)].copy()
 
     if config.exclude_funds and "CoName" in filtered.columns:
         excluded_pattern = r"ETF|ETN|REIT|投資法人|インフラファンド|ベンチャーファンド"
@@ -562,12 +560,12 @@ def build_pipeline_table(
         [
             {"stage": "買いシグナル", "count": price_candidate_count, "share_vs_initial": 1.0 if price_candidate_count else 0.0},
             {
-                "stage": "市場・業種フィルター後",
+                "stage": "市場フィルター後",
                 "count": market_filtered_count,
                 "share_vs_initial": market_filtered_count / baseline,
             },
             {
-                "stage": "フィルター適用後",
+                "stage": "スクリーニング条件適用後",
                 "count": final_signal_count,
                 "share_vs_initial": final_signal_count / baseline,
             },
@@ -692,7 +690,7 @@ def run_analysis(
     if price_candidates.empty:
         return build_empty_result(config=config, latest_price_date=latest_price_date, price_candidate_count=0)
 
-    _emit_progress(progress_callback, "シグナル日の銘柄マスタを読み込んで市場・業種フィルターを適用しています", 0.42)
+    _emit_progress(progress_callback, "シグナル日の銘柄マスタを読み込んで市場フィルターを適用しています", 0.42)
     signal_dates = pd.DatetimeIndex(price_candidates["Date"].drop_duplicates().sort_values())
     master = load_master_for_dates(client=client, dates=signal_dates, cache_dir=cache_dir)
     market_candidates = attach_master(price_candidates, master, config)
