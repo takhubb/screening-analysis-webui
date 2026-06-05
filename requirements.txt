@@ -1,6 +1,6 @@
 streamlit==1.45.1
 pandas==2.2.3
 numpy==2.2.5
-pyarrow==20.0.0
+pyarrow==23.0.1
 python-dateutil==2.9.0.post0
 jquants-api-client==2.0.1
